@@ -27,6 +27,7 @@ import (
 	"time"
 )
 
+
 const OP_TLS = 0x16
 const OP_LDAP = 0x30
 const BEROP_EXTENDED_REQUEST = 0x77
@@ -46,6 +47,7 @@ func (conn readOnlyConn) SetDeadline(t time.Time) error      { return nil }
 func (conn readOnlyConn) SetReadDeadline(t time.Time) error  { return nil }
 func (conn readOnlyConn) SetWriteDeadline(t time.Time) error { return nil }
 
+
 /*
 Application BER Types Used in LDAP can be found here:
 
@@ -54,7 +56,6 @@ https://ldap.com/ldapv3-wire-protocol-reference-asn1-ber/
  */
 func handleConnection(c net.Conn) {
 	var (
-		total = 0
 		backendConnection net.Conn
 		clientReader io.Reader
 	)
@@ -74,9 +75,8 @@ func handleConnection(c net.Conn) {
 			break
 		}
 
-		total += n
 		if n >= 7 {
-			if buf[0] == OP_LDAP { // LDAP operation
+			if buf[0] == OP_LDAP {  // LDAP operation
 				type ldapPacket struct {
 					Length    byte
 					MessageID byte
@@ -109,7 +109,7 @@ func handleConnection(c net.Conn) {
 						beropBytes = n
 					}
 				}
-			} else if buf[0] == OP_TLS { // TLS Handshake
+			} else if buf[0] == OP_TLS {  // TLS Handshake
 				var hello *tls.ClientHelloInfo
 				err := tls.Server(readOnlyConn{buf: buf}, &tls.Config{
 					GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -132,10 +132,12 @@ func handleConnection(c net.Conn) {
 				defer backendConnection.Close()
 
 				fmt.Println(backendConnection.LocalAddr().String(), hello.ServerName)
+				// send intercepted LDAP_START_TLS_OID berop extended request to server
+				// but intercept extended response because we already pretended tls support before
 				backendConnection.Write(peekedBytes.Next(beropBytes))
-				backendConnection.Read(buf)  // surpress LDAP_START_TLS_OID berop extended response from server
+				backendConnection.Read(buf)  // suppress berop extended response
 				if buf[0] == OP_LDAP && buf[5] == BEROP_EXTENDED_RESPONSE {
-					// concat peeked tls request and client connection for further processing
+					// concat peeked tls request and client connection for further processing/proxying
 					clientReader = io.MultiReader(peekedBytes, c)
 					break
 				}
