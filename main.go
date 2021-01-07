@@ -18,12 +18,33 @@
 package main
 
 import (
-	"encoding/hex"
+	"bytes"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"time"
 )
+
+const OP_TLS = 0x16
+const OP_LDAP = 0x30
+const BEROP_EXTENDED_REQUEST = 0x77
+const BEROP_EXTENDED_RESPONSE = 0x78
+const LDAP_START_TLS_OID = "1.3.6.1.4.1.1466.20037"
+
+
+type readOnlyConn struct {
+	buf []byte
+}
+func (conn readOnlyConn) Read(p []byte) (int, error)         { return copy(p, conn.buf), nil }
+func (conn readOnlyConn) Write(p []byte) (int, error)        { return 0, io.ErrClosedPipe }
+func (conn readOnlyConn) Close() error                       { return nil }
+func (conn readOnlyConn) LocalAddr() net.Addr                { return nil }
+func (conn readOnlyConn) RemoteAddr() net.Addr               { return nil }
+func (conn readOnlyConn) SetDeadline(t time.Time) error      { return nil }
+func (conn readOnlyConn) SetReadDeadline(t time.Time) error  { return nil }
+func (conn readOnlyConn) SetWriteDeadline(t time.Time) error { return nil }
 
 /*
 Application BER Types Used in LDAP can be found here:
@@ -33,23 +54,19 @@ https://ldap.com/ldapv3-wire-protocol-reference-asn1-ber/
  */
 func handleConnection(c net.Conn) {
 	var (
-		ioff = 0
 		total = 0
-		msgid byte
-		msglen byte
-		berop byte
-		beroplen byte
-		resultcode byte
-		sniname string
-
-		buf_ldap_extop_req []byte
-		bk_c net.Conn
+		backendConnection net.Conn
+		clientReader io.Reader
 	)
 
 	buf := make([]byte, 1024)
 
+	peekedBytes := new(bytes.Buffer)
+	peekReader := io.TeeReader(c, peekedBytes)
+	beropBytes := 0
+
 	for {
-		n, err := c.Read(buf)
+		n, err := peekReader.Read(buf)
 		if err != nil {
 			if err != io.EOF {
 				fmt.Println("read error:", err)
@@ -58,143 +75,86 @@ func handleConnection(c net.Conn) {
 		}
 
 		total += n
-		if n >= 5 {
-			if buf[0] == 0x16 {  // TLS Handshake
-				fmt.Printf("TLS Handshake - len: %d\n", buf[1])
-				if buf[5] == 0x1 {
-					ioff = 1 + 5 + 3 + 2 + 32
-					fmt.Println(" * Client Hello")
-					fmt.Printf("    * Session-ID length: %d\n", buf[ioff])
-					ioff += 1 + int(buf[ioff])  // Session-ID length
-					cipherlen := (int(buf[ioff]) << 8) + int(buf[ioff + 1])
-					fmt.Printf("    * Cipher-Suites length: %d\n", cipherlen)
-					ioff += 2 + cipherlen
-					fmt.Printf("    * Compression method length: %d\n", buf[ioff])
-					ioff += 1 + int(buf[ioff])
-					extensionlen := (int(buf[ioff]) << 8) + int(buf[ioff + 1])
-					fmt.Printf("    * Extensions length: %d\n", extensionlen)
-					ioff += 2
-					extype := (int(buf[ioff]) << 8) + int(buf[ioff + 1])
-					extlen := (int(buf[ioff + 2]) << 8) + int(buf[ioff + 3])
-					ioff += 2 + 2
-					fmt.Printf("    * Extension type: %d length: %d\n", extype, extlen)
-					if extype == 0 {
-						fmt.Println("      * server_name")
-						fmt.Printf("%#x %#x %#x %#x\n", buf[ioff], buf[ioff + 1], buf[ioff + 2], buf[ioff + 3])
-						// assuming one sni entry of type hostname
-						ioff += 2
-						snametype := buf[ioff]
-						ioff++
-						if snametype == 0 {
-							snilen := (int(buf[ioff]) << 8) + int(buf[ioff + 1])
-							fmt.Printf("        * SNI type: host_name (type: %d) length: %d\n", snametype, snilen)
-							ioff += 2
-							sniname = string(buf[ioff:ioff+snilen])
-							fmt.Println("        * SNI server_name:", sniname)
-							if buf_ldap_extop_req != nil {
-								fmt.Println("PROXY LDAP REQ")
-								bk_c, err = net.Dial("tcp", sniname + ":389")
-								if err != nil {
-									fmt.Println("dial error:", err)
-									return
-								}
-								defer bk_c.Close()
+		if n >= 7 {
+			if buf[0] == OP_LDAP { // LDAP operation
+				type ldapPacket struct {
+					Length    byte
+					MessageID byte
+					BerOp     byte
+				}
 
-								bk_c.Write(buf_ldap_extop_req)
-								tmpbuf := make([]byte, 1024)
-								bk_c.Read(tmpbuf)
-								if tmpbuf[0] == 0x30 && tmpbuf[5] == 0x78 {
-									fmt.Printf("sbuf: %#x %#x\n", tmpbuf[0], tmpbuf[5])
-									fmt.Println("surpressed LDAP_START_TLS_OID ExtendedResponse")
-								}
-							}
-						}
-						//fmt.Printf("%#x %#x %#x %#x\n", buf[ioff], buf[ioff + 1], buf[ioff + 2], buf[ioff + 3])
+				packet := ldapPacket{Length: buf[1], MessageID: buf[4], BerOp: buf[5]}
+				if packet.BerOp == BEROP_EXTENDED_REQUEST {
+					if n < 22 {
+						continue
+					}
+					oid := string(buf[n-22 : n])
+					if oid == LDAP_START_TLS_OID {
+						// pretend we support TLS
+						resp := []byte{0x30, 0x5f, 0x2, 0x1, 0x1, 0x78, 0x5a, 0xa,
+							0x1, 0x0, 0x4, 0x0, 0x4, 0x3b, 0x53, 0x74,
+							0x61, 0x72, 0x74, 0x20, 0x54, 0x4c, 0x53, 0x20,
+							0x72, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x20,
+							0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x65, 0x64,
+							0x2e, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x20,
+							0x77, 0x69, 0x6c, 0x6c, 0x69, 0x6e, 0x67, 0x20,
+							0x74, 0x6f, 0x20, 0x6e, 0x65, 0x67, 0x6f, 0x74,
+							0x69, 0x61, 0x74, 0x65, 0x20, 0x53, 0x53, 0x4c,
+							0x2e, 0x8a, 0x16, 0x31, 0x2e, 0x33, 0x2e, 0x36,
+							0x2e, 0x31, 0x2e, 0x34, 0x2e, 0x31, 0x2e, 0x31,
+							0x34, 0x36, 0x36, 0x2e, 0x32, 0x30, 0x30, 0x33, 0x37}
+						// update response messageID with requested one
+						resp[4] = packet.MessageID
+						c.Write(resp)
+						beropBytes = n
 					}
 				}
-			}
-			if buf[0] == 0x30 {  // LDAP operation
-				msglen = buf[1]
-				msgid = buf[4]
-				berop = buf[5]
-				beroplen = buf[6]
-				/*
-				7: 0a
-				8: 01
-				 */
-				resultcode = byte(0)
-				fmt.Printf("LDAP [%d] len: %d opcode %#x\n", msgid, msglen, berop)
-				if berop == 0x77 {
-					fmt.Printf(" * ExtendedRequest len: %d resultcode: %d\n", beroplen, resultcode)
-					if n - 22 > 0 {
-						oid := string(buf[n-22:n])
-						if oid == "1.3.6.1.4.1.1466.20037" { // LDAP_START_TLS_OID
-							//var hello *tls.ClientHelloInfo
-							fmt.Println("    * LDAP_START_TLS_OID")
-							// ExtendedResponse berop 0x78 (byte no. 6 idx 5)
-							// pretend we support TLS
-							resp := []byte{0x30, 0x5f, 0x2, 0x1, 0x1, 0x78, 0x5a, 0xa,
-								0x1, 0x0, 0x4, 0x0, 0x4, 0x3b, 0x53, 0x74,
-								0x61, 0x72, 0x74, 0x20, 0x54, 0x4c, 0x53, 0x20,
-								0x72, 0x65, 0x71, 0x75, 0x65, 0x73, 0x74, 0x20,
-								0x61, 0x63, 0x63, 0x65, 0x70, 0x74, 0x65, 0x64,
-								0x2e, 0x53, 0x65, 0x72, 0x76, 0x65, 0x72, 0x20,
-								0x77, 0x69, 0x6c, 0x6c, 0x69, 0x6e, 0x67, 0x20,
-								0x74, 0x6f, 0x20, 0x6e, 0x65, 0x67, 0x6f, 0x74,
-								0x69, 0x61, 0x74, 0x65, 0x20, 0x53, 0x53, 0x4c,
-								0x2e, 0x8a, 0x16, 0x31, 0x2e, 0x33, 0x2e, 0x36,
-								0x2e, 0x31, 0x2e, 0x34, 0x2e, 0x31, 0x2e, 0x31,
-								0x34, 0x36, 0x36, 0x2e, 0x32, 0x30, 0x30, 0x33, 0x37}
-							resp[4] = msgid
-							buf_ldap_extop_req = make([]byte, n)
-							copy(buf_ldap_extop_req, buf)
-							c.Write(resp)
-							//tls.Server(c, &tls.Config{
-							//	GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
-							//		hello = new(tls.ClientHelloInfo)
-							//		*hello = *argHello
-							//		return nil, nil
-							//	},
-							//}).Handshake()
-							//c.readClientHello()
-							//fmt.Println("ServerName: ", hello.ServerName)
-						}
-					}
+			} else if buf[0] == OP_TLS { // TLS Handshake
+				var hello *tls.ClientHelloInfo
+				err := tls.Server(readOnlyConn{buf: buf}, &tls.Config{
+					GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
+						hello = new(tls.ClientHelloInfo)
+						*hello = *argHello
+						return nil, nil
+					},
+				}).Handshake()
+
+				if hello == nil {
+					fmt.Println("error on intercepting client hello (tls handshake)")
+					return
 				}
-			}
-			fmt.Println(hex.EncodeToString(buf[:n]))
-			if bk_c != nil {
-				bk_c.Write(buf[:n])
-				n, err = bk_c.Read(buf)
-				//if buf[0] == 0x30 && buf[5] == 0x78 {
-				//	fmt.Printf("sbuf: %#x %#x\n", buf[0], buf[5])
-				//	fmt.Println("surpressed LDAP_START_TLS_OID ExtendedResponse")
-				//	continue
-				//}
-				c.Write(buf[:n])
-				break
-			} else {
-				fmt.Println("backend connection is not open")
+				// got client hello
+				backendConnection, err = net.Dial("tcp", hello.ServerName+":389")
+				if err != nil {
+					fmt.Println("error on creating backend connection", err)
+					return
+				}
+				defer backendConnection.Close()
+
+				fmt.Println(backendConnection.LocalAddr().String(), hello.ServerName)
+				backendConnection.Write(peekedBytes.Next(beropBytes))
+				backendConnection.Read(buf)  // surpress LDAP_START_TLS_OID berop extended response from server
+				if buf[0] == OP_LDAP && buf[5] == BEROP_EXTENDED_RESPONSE {
+					// concat peeked tls request and client connection for further processing
+					clientReader = io.MultiReader(peekedBytes, c)
+					break
+				}
 			}
 		}
-		fmt.Println(n)
-
 	}
-	fmt.Println("total: ", total)
-	fmt.Println("SNI detection finished")
-	fmt.Println("  ServerName:", sniname)
+	// SNI detection finished proxy all requests
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
-		io.Copy(c, bk_c)
+		io.Copy(c, backendConnection)
 		c.(*net.TCPConn).CloseWrite()
 		wg.Done()
 	}()
 	go func() {
-		io.Copy(bk_c, c)
-		bk_c.(*net.TCPConn).CloseWrite()
+		io.Copy(backendConnection, clientReader)
+		backendConnection.(*net.TCPConn).CloseWrite()
 		wg.Done()
 	}()
 
