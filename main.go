@@ -124,7 +124,7 @@ func handleConnection(c net.Conn) {
 					return
 				}
 				// got client hello
-				backendConnection, err = net.Dial("tcp", hello.ServerName+":389")
+				backendConnection, err = net.Dial("tcp", net.JoinHostPort(hello.ServerName, "389"))
 				if err != nil {
 					fmt.Println("error on creating backend connection", err)
 					return
