@@ -162,7 +162,9 @@ func handleConnection(c net.Conn) {
 
 	wg.Wait()
 
-	c.Close()
+	if backendConnection != nil {
+		fmt.Println(backendConnection.LocalAddr().String(), "**closed connection**")
+	}
 }
 
 
