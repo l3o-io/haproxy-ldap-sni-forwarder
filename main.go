@@ -35,6 +35,10 @@ const BEROP_EXTENDED_RESPONSE = 0x78
 const LDAP_START_TLS_OID = "1.3.6.1.4.1.1466.20037"
 
 
+const CLIENT_DEADLINE_SECONDS = 5
+const BACKEND_TIMEOUT_SECONDS = 5
+
+
 type readOnlyConn struct {
 	buf []byte
 }
@@ -59,6 +63,12 @@ func handleConnection(c net.Conn) {
 		backendConnection net.Conn
 		clientReader io.Reader
 	)
+	defer c.Close()
+
+	err := c.SetReadDeadline(time.Now().Add(CLIENT_DEADLINE_SECONDS * time.Second))
+	if err != nil {
+		fmt.Println("Could not set client read deadline")
+	}
 
 	buf := make([]byte, 1024)
 
@@ -73,6 +83,10 @@ func handleConnection(c net.Conn) {
 				fmt.Println("read error:", err)
 			}
 			return
+		}
+		err = c.SetReadDeadline(time.Time{})
+		if err != nil {
+			fmt.Println("Could not reset client read deadline")
 		}
 
 		if n >= 7 {
@@ -124,7 +138,8 @@ func handleConnection(c net.Conn) {
 					return
 				}
 				// got client hello
-				backendConnection, err = net.Dial("tcp", net.JoinHostPort(hello.ServerName, "389"))
+				backendConnection, err = net.DialTimeout("tcp", net.JoinHostPort(hello.ServerName, "389"),
+					BACKEND_TIMEOUT_SECONDS*time.Second)
 				if err != nil {
 					fmt.Println("error on creating backend connection", err)
 					return
