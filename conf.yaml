@@ -1,0 +1,13 @@
+#server:
+#  port: 3389
+
+haproxy:
+  host: router-389ds
+  port: 3389
+  controlport: 9999
+
+backend:
+  port: 3389
+  hosts:
+    ldap.centos-8.shared: ldap
+    ldap2.centos-8.shared: ldap2

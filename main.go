@@ -22,9 +22,11 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"sync"
 	"time"
+	"gopkg.in/yaml.v2"
 )
 
 
@@ -37,6 +39,10 @@ const LDAP_START_TLS_OID = "1.3.6.1.4.1.1466.20037"
 
 const CLIENT_DEADLINE_SECONDS = 5
 const BACKEND_TIMEOUT_SECONDS = 5
+
+
+const DEFAULT_PORT = "3389"
+const DEFAULT_HA_MAP = "/etc/haproxy/tcp2be.map"
 
 
 type readOnlyConn struct {
@@ -52,18 +58,42 @@ func (conn readOnlyConn) SetReadDeadline(t time.Time) error  { return nil }
 func (conn readOnlyConn) SetWriteDeadline(t time.Time) error { return nil }
 
 
+type HaProxy struct {
+	Host string
+	Port string
+	ControlPort string
+}
+
+
+type YamlConfig struct {
+	Server struct {
+		Host string
+		Port string
+	}
+	HaProxy HaProxy
+	Backend struct {
+		Port string
+		Hosts map[string]string
+	}
+}
+
+
 /*
 Application BER Types Used in LDAP can be found here:
 
 https://ldap.com/ldapv3-wire-protocol-reference-asn1-ber/
 
  */
-func handleConnection(c net.Conn) {
+func handleConnection(c net.Conn, config *YamlConfig) {
 	var (
 		backendConnection net.Conn
+		controlConnection net.Conn
 		clientReader io.Reader
+		hasHaProxy bool
 	)
 	defer c.Close()
+
+	hasHaProxy = config.HaProxy != HaProxy{}
 
 	err := c.SetReadDeadline(time.Now().Add(CLIENT_DEADLINE_SECONDS * time.Second))
 	if err != nil {
@@ -124,7 +154,11 @@ func handleConnection(c net.Conn) {
 					}
 				}
 			} else if buf[0] == OP_TLS {  // TLS Handshake
-				var hello *tls.ClientHelloInfo
+				var (
+					hello *tls.ClientHelloInfo
+					srcAddress *net.TCPAddr
+					destAddress *net.TCPAddr
+				)
 				err := tls.Server(readOnlyConn{buf: buf}, &tls.Config{
 					GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
 						hello = new(tls.ClientHelloInfo)
@@ -138,8 +172,53 @@ func handleConnection(c net.Conn) {
 					return
 				}
 				// got client hello
-				backendConnection, err = net.DialTimeout("tcp", net.JoinHostPort(hello.ServerName, "389"),
-					BACKEND_TIMEOUT_SECONDS*time.Second)
+				backendAddr, ok := config.Backend.Hosts[hello.ServerName]
+				if ! ok {
+					fmt.Println("error: cannot find backend for SNI server name", hello.ServerName)
+					return
+				}
+
+				if hasHaProxy {
+					l, err := net.Listen("tcp4", ":0")
+					if err != nil {
+						fmt.Println("error on getting source port for proxy connection", err)
+						return
+					}
+					srcPort := fmt.Sprintf("%d", l.Addr().(*net.TCPAddr).Port)
+					srcAddress, _ = net.ResolveTCPAddr("tcp", net.JoinHostPort("", srcPort))
+					destAddress, _ = net.ResolveTCPAddr("tcp",
+						net.JoinHostPort(config.HaProxy.Host, config.HaProxy.Port))
+					l.Close()
+
+					// create control connection
+					controlConnection, err = net.DialTimeout("tcp",
+						net.JoinHostPort(config.HaProxy.Host, config.HaProxy.ControlPort),
+						BACKEND_TIMEOUT_SECONDS * time.Second)
+					if err != nil {
+						fmt.Println("error on creating control socket", err)
+						return
+					}
+					// add map entry using control socket
+					localAddress := net.JoinHostPort(controlConnection.LocalAddr().(*net.TCPAddr).IP.String(), srcPort)
+					_, err = controlConnection.Write([]byte(fmt.Sprintf("add map %s %s %s\n",
+						DEFAULT_HA_MAP, localAddress, backendAddr)))
+					if err != nil {
+						fmt.Println("error writing to control socket", err)
+						return
+					}
+					_, err = controlConnection.Read(buf)
+					if err != nil {
+						fmt.Println("error reading from control socket", err)
+						return
+					}
+				} else {
+					srcAddress, _ = net.ResolveTCPAddr("tcp", net.JoinHostPort("", ":0"))
+					destAddress, _ = net.ResolveTCPAddr("tcp",
+						net.JoinHostPort(backendAddr, config.Backend.Port))
+				}
+
+				// connect to backend either via HaProxy or directly depending on configuration
+				backendConnection, err = net.DialTCP("tcp", srcAddress, destAddress)
 				if err != nil {
 					fmt.Println("error on creating backend connection", err)
 					return
@@ -178,14 +257,59 @@ func handleConnection(c net.Conn) {
 	wg.Wait()
 
 	if backendConnection != nil {
-		fmt.Println(backendConnection.LocalAddr().String(), "**closed connection**")
+		localAddr := backendConnection.LocalAddr().String()
+		fmt.Println(localAddr, "**closed connection**")
+		controlConnection, err = net.DialTimeout("tcp",
+			net.JoinHostPort(config.HaProxy.Host, config.HaProxy.ControlPort),
+			BACKEND_TIMEOUT_SECONDS * time.Second)
+		if err != nil {
+			fmt.Println("error on creating control socket", err)
+			return
+		}
+		_, err := controlConnection.Write([]byte(fmt.Sprintf("del map %s %s\n",
+			DEFAULT_HA_MAP, localAddr)))
+		if err != nil {
+			fmt.Println("error writing to control socket", err)
+			return
+		}
+		_, err = controlConnection.Read(buf)
+		if err != nil {
+			fmt.Println("error reading from control socket", err)
+			return
+		}
+		controlConnection.Close()
 	}
 }
 
 
 func main() {
-	fmt.Println("ldap sni proxy server listening on port 3389")
-	l, err := net.Listen("tcp4", ":3389")
+	config := YamlConfig{}
+
+	yamlFile, err := ioutil.ReadFile("conf.yaml")
+	if err != nil {
+		fmt.Println("error opening configuration file", err)
+		return
+	}
+	err = yaml.Unmarshal(yamlFile, &config)
+	if err != nil {
+		fmt.Println("error reading configuration file", err)
+		return
+	}
+	if len(config.Backend.Hosts) <= 0 {
+		fmt.Println("error reading backends from configuration file")
+		return
+	}
+	// Apply defaults if necessary
+	if config.Server.Port == "" {
+		config.Server.Port = DEFAULT_PORT
+	}
+	if config.Backend.Port == "" {
+		config.Backend.Port = DEFAULT_PORT
+	}
+
+	listenAddr := net.JoinHostPort(config.Server.Host, config.Server.Port)
+	fmt.Println("ldap sni proxy server listening on", listenAddr)
+	l, err := net.Listen("tcp4", listenAddr)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -198,6 +322,6 @@ func main() {
 			fmt.Println(err)
 			return
 		}
-		go handleConnection(c)
+		go handleConnection(c, &config)
 	}
 }
