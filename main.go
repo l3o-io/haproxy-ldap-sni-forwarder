@@ -72,7 +72,7 @@ func handleConnection(c net.Conn) {
 			if err != io.EOF {
 				fmt.Println("read error:", err)
 			}
-			break
+			return
 		}
 
 		if n >= 7 {
